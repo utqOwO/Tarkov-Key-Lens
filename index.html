@@ -370,6 +370,20 @@
 
       const DATA = window.TARKOV_KEY_DATA || { keys: [], maps: [], generatedAt: '', source: {} };
       const KEY_BY_ID = new Map(DATA.keys.map((key) => [key.id, key]));
+      const NON_KEY_ID = '__tarkov-key-tool__';
+      const NON_KEY_TOOL = {
+        id: NON_KEY_ID,
+        name: 'Key tool（鍵収納ケース）',
+        shortName: 'Key tool',
+        normalizedName: 'key-tool',
+        aliases: ['Key tool', 'Keytool'],
+        uses: null,
+        usages: [],
+        wiki: 'https://escapefromtarkov.fandom.com/wiki/Key_tool',
+        link: 'https://tarkov.dev/item/key-tool',
+        kind: 'non-key'
+      };
+      KEY_BY_ID.set(NON_KEY_ID, NON_KEY_TOOL);
       const MAPS_BY_NAME = new Map(DATA.maps.map((map) => [map.name, map]));
       const state = {
         image: null,
@@ -393,6 +407,9 @@
         ocrMode: '',
         ocrBusy: false,
         lastOcrText: '',
+        visualBusy: false,
+        visualReady: false,
+        gridOcrText: '',
         imageLoadToken: 0,
         pendingAutoOcr: false,
         renderQueued: false,
@@ -440,6 +457,10 @@
           yzray: 'xray',
           rbavo: 'rbvo',
           rbac: 'rbao',
+          rbaq: 'rbao',
+          rbbsv1: 'rbpsv1',
+          rbbsv2: 'rbpsv2',
+          rbpkris: 'rbpkpts',
           rbrsvi: 'rbpsvi',
           rbrsv2: 'rbpsv2',
           rbzst: 'rbst',
@@ -472,7 +493,14 @@
         if (!base) return [];
         const variants = new Set([base]);
         const queue = [{ value: base, depth: 0 }];
-        const replacements = { b: '8', i: '1', l: '1', o: '0', s: '5', g: '9', q: '9' };
+        // These alternatives are limited to structured inventory codes.  A
+        // global replacement would make ordinary names such as "Safe" match
+        // unrelated keys, but B/P, 8/0 and Q/O are common in RB/W/E codes.
+        const replacements = {
+          b: ['8', 'p'], p: ['b'], i: ['1'], l: ['1'], o: ['0'], q: ['9', 'o'],
+          s: ['5'], g: ['9'], '8': ['0', 'b'], '0': ['8'], '1': ['i'], '5': ['s'],
+          '9': ['g', 'q'], v: ['y'], y: ['v']
+        };
         while (queue.length && variants.size < 40) {
           const current = queue.shift();
           if (!current || current.depth >= 2) continue;
@@ -488,12 +516,14 @@
             }
           }
           for (let index = 0; index < valueText.length; index++) {
-            const replacement = replacements[valueText[index]];
-            if (!replacement || replacement === valueText[index]) continue;
-            const replaced = `${valueText.slice(0, index)}${replacement}${valueText.slice(index + 1)}`;
-            if (!variants.has(replaced)) {
-              variants.add(replaced);
-              queue.push({ value: replaced, depth: current.depth + 1 });
+            const options = replacements[valueText[index]] || [];
+            for (const replacement of options) {
+              if (!replacement || replacement === valueText[index]) continue;
+              const replaced = `${valueText.slice(0, index)}${replacement}${valueText.slice(index + 1)}`;
+              if (!variants.has(replaced)) {
+                variants.add(replaced);
+                queue.push({ value: replaced, depth: current.depth + 1 });
+              }
             }
           }
         }
@@ -512,6 +542,22 @@
           }
         }
         return best;
+      }
+
+      function codeLikeScore(alias, value) {
+        const left = String(alias || '').trim();
+        const right = String(value || '').trim();
+        if (!/^[a-z]{1,5}[- ]?[a-z0-9]{1,8}$/i.test(left) || !/^[a-z]{1,5}[- ]?[a-z0-9]{1,8}$/i.test(right)) return 0;
+        const leftVariants = roomCodeVariants(left);
+        const rightVariants = roomCodeVariants(right);
+        let best = 0;
+        for (const observed of rightVariants) {
+          for (const expected of leftVariants) {
+            const denominator = Math.max(observed.length, expected.length);
+            if (denominator) best = Math.max(best, 1 - editDistance(observed, expected) / denominator);
+          }
+        }
+        return best >= .72 ? best : 0;
       }
 
       function structuredLabelScore(alias, value, preparedValue = null) {
@@ -733,7 +779,8 @@
         return [...new Set([
           text,
           text.replace(/@/g, '0').replace(/5ar?n/gi, 'san').replace(/5an/gi, 'san').replace(/[,:]/g, ''),
-          text.replace(/([we][a-z0-9]{2,7})[\s._,-]*(?:s|5)(?:a|4)n/gi, '$1 San')
+          text.replace(/([we][a-z0-9]{2,7})[\s._,-]*(?:g|s|5)(?:a|4)n/gi, '$1 San'),
+          text.replace(/\b(dorm)[\s._,-]*([0-9]{1,3})\b/gi, '$1 $2')
         ])];
       }
 
@@ -780,12 +827,51 @@
         return score;
       }
 
+      function shortNameScore(shortName, value, preparedValue = null) {
+        const alias = String(shortName || '').trim();
+        const prepared = preparedValue || getMatchTextInfo(value);
+        if (!alias || !prepared.normalized) return 0;
+        const aliasInfo = getMatchTextInfo(alias);
+        if (prepared.normalized === aliasInfo.normalized || prepared.compared === aliasInfo.compared) return 1;
+        if (prepared.rawTokens.some((token) => normalizeText(token) === aliasInfo.normalized)) return .99;
+        const codeScore = codeLikeScore(alias, value);
+        if (codeScore) return codeScore;
+        const similarity = Math.max(
+          1 - editDistance(aliasInfo.normalized, prepared.normalized) / Math.max(aliasInfo.normalized.length, prepared.normalized.length),
+          1 - editDistance(aliasInfo.compared, prepared.compared) / Math.max(aliasInfo.compared.length, prepared.compared.length)
+        );
+        if (similarity < .60) return 0;
+        // A near match against the displayed short name is much stronger
+        // evidence than a coincidental match against a long database title.
+        return .50 + similarity * .45;
+      }
+
+      function dormRoomScore(alias, value) {
+        const expected = String(alias || '').match(/\bdorm\s*([0-9]{3})\b/i)?.[1];
+        const observed = String(value || '').match(/\bdorm\s*([0-9]{1,3})\b/i)?.[1];
+        if (!expected || !observed) return 0;
+        if (expected === observed) return 1;
+        if (observed.length === 2 && expected.endsWith(observed)) return .88;
+        if (observed.length === 1 && expected.endsWith(observed)) return .76;
+        return 0;
+      }
+
+      function keyToolScore(value) {
+        const normalized = normalizeText(value);
+        if (!normalized) return 0;
+        if (normalized === 'keytool') return 1;
+        if (normalized.startsWith('key') && editDistance(normalized, 'keytool') <= 1) return .92;
+        return 0;
+      }
+
       function chooseBestMatch(text) {
         const cleanedText = stripUsageText(text);
         const labelTexts = labelSegments(text).flatMap((segment) => ocrLabelVariants(segment));
         const cleanedInfo = getMatchTextInfo(cleanedText);
         const labelInfos = labelTexts.map((segment) => ({ text: segment, info: getMatchTextInfo(segment) }));
         if (!normalizeText(cleanedText) && !labelTexts.some((segment) => normalizeText(segment))) return [];
+        const keyTool = Math.max(0, ...labelTexts.map((segment) => keyToolScore(segment)));
+        if (keyTool >= .9) return [{ keyId: NON_KEY_ID, key: NON_KEY_TOOL, score: keyTool, alias: 'Key tool', matchKind: 'non-key' }];
         const scored = [];
         for (const key of DATA.keys) {
           let best = 0;
@@ -794,15 +880,23 @@
           for (const alias of (key.aliases || [])) {
             const labelScore = Math.max(0, ...labelInfos.map((segment) => scoreAlias(alias, segment.text, segment.info)));
             const structuredScore = Math.max(0, ...labelInfos.map((segment) => structuredLabelScore(alias, segment.text, segment.info)));
+            const codeScore = Math.max(0, ...labelInfos.map((segment) => codeLikeScore(alias, segment.text)));
+            const dormScore = Math.max(0, ...labelInfos.map((segment) => dormRoomScore(alias, segment.text)));
             const fullScore = scoreAlias(alias, cleanedText, cleanedInfo);
             // The first text segment is normally the item label.  Keep the
             // complete cell as a weaker fallback when that segment is noisy.
-            const score = Math.max(labelScore, structuredScore, fullScore * .72);
+            const score = Math.max(labelScore, structuredScore, codeScore, dormScore, fullScore * .72);
             if (score > best) {
               best = score;
               bestAlias = alias;
               bestKind = structuredScore >= score && structuredScore > labelScore ? 'room-code' : score >= .99 ? 'exact' : 'fuzzy';
             }
+          }
+          const shortScore = Math.max(0, ...labelInfos.map((segment) => shortNameScore(key.shortName, segment.text, segment.info)));
+          if (shortScore > best) {
+            best = shortScore;
+            bestAlias = key.shortName || key.name;
+            bestKind = shortScore >= .99 ? 'exact' : 'fuzzy';
           }
           if (best) scored.push({ keyId: key.id, key, score: best, alias: bestAlias, matchKind: bestKind });
         }
@@ -867,12 +961,16 @@
         const first = matches[0];
         const second = matches[1];
         const margin = second ? first.score - second.score : 1;
-        const firstIsExact = first.score >= .99;
-        const secondIsExact = second?.score >= .99;
-        const ambiguous = first.score < .62 || (second && margin < .09 && !(firstIsExact && !secondIsExact));
+        const firstIsExact = first.score >= .995;
+        const secondIsExact = second?.score >= .995;
+        const equivalentExactLabel = Boolean(second && first.score >= .98 && second.score >= .98
+          && normalizeText(first.key.shortName) === normalizeText(second.key.shortName)
+          && Number(first.key.uses) === Number(second.key.uses)
+          && JSON.stringify(mapNamesForKey(first.key).sort()) === JSON.stringify(mapNamesForKey(second.key).sort()));
+        const ambiguous = first.score < .62 || (second && margin < .09 && !(firstIsExact && !secondIsExact) && !equivalentExactLabel);
         result.keyId = ambiguous ? first.keyId : first.keyId;
         result.status = ambiguous ? 'ambiguous' : 'identified';
-        result.matchKind = first.matchKind || (firstIsExact ? 'exact' : 'fuzzy');
+        result.matchKind = equivalentExactLabel ? 'label-only' : first.matchKind || (firstIsExact ? 'exact' : 'fuzzy');
         result.confidence = clamp(Math.round((first.score * .82 + (ocrConfidence ? ocrConfidence / 100 * .18 : .08)) * 100), 1, 99);
         const usage = parseUsage(result.ocrText, first.key);
         if (usage) { result.remaining = usage.remaining; result.maximum = usage.maximum; result.usageSource = 'ocr'; }
@@ -880,109 +978,218 @@
       }
 
       const visualIconCache = new Map();
+      const visualSignatureCache = new Map();
 
       function localIconUrl(key) {
-        return `./vendor/key-icons/${encodeURIComponent(key.id)}-icon.webp`;
+        return './vendor/key-icons/' + encodeURIComponent(key.id) + '-icon.webp';
       }
 
       function loadLocalIcon(key) {
         if (visualIconCache.has(key.id)) return visualIconCache.get(key.id);
+        const sources = [...new Set([localIconUrl(key), key.icon].filter(Boolean))];
         const promise = new Promise((resolve) => {
-          const image = new Image();
-          image.onload = () => resolve(image);
-          image.onerror = () => resolve(null);
-          image.src = localIconUrl(key);
+          let sourceIndex = 0;
+          const loadNext = () => {
+            const source = sources[sourceIndex++];
+            if (!source) { resolve(null); return; }
+            const image = new Image();
+            if (/^https?:/i.test(source)) image.crossOrigin = 'anonymous';
+            image.decoding = 'async';
+            image.onload = () => resolve(image);
+            image.onerror = loadNext;
+            image.src = source;
+          };
+          loadNext();
         });
         visualIconCache.set(key.id, promise);
         return promise;
       }
 
-      function makeSignature(source, crop = null, size = 24) {
+      function makeSignature(source, crop = null, size = 32) {
+        if (!source || !size) return null;
         const canvas = document.createElement('canvas');
         canvas.width = size; canvas.height = size;
         const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) return null;
         context.imageSmoothingEnabled = true;
-        if (crop) context.drawImage(source, crop.x, crop.y, crop.width, crop.height, 0, 0, size, size);
-        else context.drawImage(source, 0, 0, size, size);
-        const pixels = context.getImageData(0, 0, size, size).data;
-        const signature = new Float32Array(size * size * 3);
-        for (let index = 0, target = 0; index < pixels.length; index += 4, target += 3) {
-          signature[target] = pixels[index] / 255;
-          signature[target + 1] = pixels[index + 1] / 255;
-          signature[target + 2] = pixels[index + 2] / 255;
+        context.fillStyle = '#101820';
+        context.fillRect(0, 0, size, size);
+        try {
+          if (crop) context.drawImage(source, crop.x, crop.y, crop.width, crop.height, 0, 0, size, size);
+          else {
+            const sourceWidth = source.naturalWidth || source.width;
+            const sourceHeight = source.naturalHeight || source.height;
+            context.drawImage(source, 0, 0, sourceWidth, sourceHeight, 0, 0, size, size);
+          }
+          const pixels = context.getImageData(0, 0, size, size).data;
+          const count = size * size;
+          const gray = new Float32Array(count);
+          const ink = new Float32Array(count);
+          const chroma = new Float32Array(count);
+          const edge = new Float32Array(count);
+          for (let index = 0, pixel = 0; index < pixels.length; index += 4, pixel++) {
+            const red = pixels[index], green = pixels[index + 1], blue = pixels[index + 2];
+            const luminance = (red * .2126 + green * .7152 + blue * .0722) / 255;
+            gray[pixel] = luminance;
+            ink[pixel] = clamp((luminance - .10) / .66, 0, 1);
+            chroma[pixel] = ((red - blue) / 255) * .5 + .5;
+          }
+          for (let y = 0; y < size; y++) {
+            for (let x = 0; x < size; x++) {
+              const index = y * size + x;
+              const right = gray[y * size + Math.min(size - 1, x + 1)];
+              const down = gray[Math.min(size - 1, y + 1) * size + x];
+              edge[index] = clamp(Math.hypot(gray[index] - right, gray[index] - down) * 4.5, 0, 1);
+            }
+          }
+          return { size, gray, ink, chroma, edge };
+        } catch (_) {
+          // A remote icon without CORS permission can still be displayed, but
+          // it cannot be sampled by canvas for pixel matching.
+          return null;
+        } finally {
+          canvas.width = 1; canvas.height = 1;
         }
-        return signature;
       }
 
-      function signatureDistance(left, right) {
+      function signatureDistance(left, right, offsetX = 0, offsetY = 0) {
+        if (!left || !right || left.size !== right.size) return 1;
+        const size = left.size;
         let distance = 0;
-        for (let index = 0; index < left.length; index += 3) {
-          const red = Math.abs(left[index] - right[index]);
-          const green = Math.abs(left[index + 1] - right[index + 1]);
-          const blue = Math.abs(left[index + 2] - right[index + 2]);
-          distance += red * .25 + green * .5 + blue * .25;
+        let count = 0;
+        for (let y = 0; y < size; y++) {
+          for (let x = 0; x < size; x++) {
+            const otherX = x + offsetX, otherY = y + offsetY;
+            if (otherX < 0 || otherX >= size || otherY < 0 || otherY >= size) continue;
+            const index = y * size + x, other = otherY * size + otherX;
+            distance += Math.abs(left.ink[index] - right.ink[other]) * .42;
+            distance += Math.abs(left.gray[index] - right.gray[other]) * .25;
+            distance += Math.abs(left.edge[index] - right.edge[other]) * .23;
+            distance += Math.abs(left.chroma[index] - right.chroma[other]) * .10;
+            count++;
+          }
         }
-        return distance / (left.length / 3);
+        return count ? distance / count : 1;
       }
 
-      function cellVisualSignature(result) {
-        const cell = result.cell;
-        const side = Math.max(12, Math.min(cell.width, cell.height) * .70);
-        const crop = {
-          x: clamp(cell.x + (cell.width - side) / 2, 0, state.canvasWidth - side),
-          y: clamp(cell.y + cell.height * .13, 0, state.canvasHeight - side),
-          width: side,
-          height: side
-        };
-        return makeSignature(state.image, crop);
+      function cellVisualSignatures(result) {
+        const cell = result?.cell;
+        if (!cell || !state.image) return [];
+        const minimumSide = Math.max(16, Math.min(cell.width, cell.height) - 2);
+        const variants = [
+          { fraction: .66, top: .16 },
+          { fraction: .74, top: .12 },
+          { fraction: .82, top: .07 }
+        ];
+        return variants.map((variant) => {
+          const side = Math.max(16, Math.min(minimumSide, minimumSide * variant.fraction));
+          const crop = {
+            x: clamp(cell.x + (cell.width - side) / 2, 0, state.canvasWidth - side),
+            y: clamp(cell.y + cell.height * variant.top, 0, state.canvasHeight - side),
+            width: side, height: side
+          };
+          return makeSignature(state.image, crop, 32);
+        }).filter(Boolean);
+      }
+
+      function visualSimilarity(samples, candidate) {
+        if (!candidate || !samples?.length) return 0;
+        let distance = 1;
+        for (const sample of samples) {
+          for (const offset of [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]]) {
+            distance = Math.min(distance, signatureDistance(sample, candidate, offset[0], offset[1]));
+          }
+        }
+        return clamp(1 - distance * 1.35, 0, 1);
+      }
+
+      function setResultFromVisual(result, key, score, kind = 'icon') {
+        result.keyId = key.id;
+        result.status = 'identified';
+        result.matchKind = kind;
+        result.confidence = clamp(Math.max(result.confidence || 0, Math.round(score * 100)), 1, 99);
+        const usage = parseUsage(result.ocrText, key);
+        if (usage) {
+          result.remaining = usage.remaining; result.maximum = usage.maximum; result.usageSource = 'ocr';
+        } else {
+          result.maximum = key.uses; result.usageSource = key.uses == null ? 'not-found' : 'database';
+        }
+      }
+
+      function applyVisualEvidence(result, ranked) {
+        const best = ranked[0], second = ranked[1];
+        if (!best) return;
+        const margin = best.score - (second?.score || 0);
+        result.visualKeyId = best.candidate.key.id;
+        result.visualScore = Math.round(best.score * 100);
+        result.visualMargin = Math.round(margin * 100);
+        const textMatches = Array.isArray(result.matches) ? result.matches : [];
+        const textTop = textMatches[0], textScore = textTop?.score || 0;
+        // The icon is a second opinion.  Similar-looking keys commonly score
+        // in the high 70s even when the best icon is wrong, so never insert a
+        // weak visual guess into the user's text candidates or downgrade a
+        // strong OCR result because of it.
+        const visualStrong = best.score >= .86 && margin >= .06;
+        const visualVeryStrong = best.score >= .91 && margin >= .08;
+        if (!visualStrong) return;
+        if (!textTop || textScore < .78) { setResultFromVisual(result, best.candidate.key, best.score); return; }
+        if (textTop.keyId === best.candidate.key.id) {
+          setResultFromVisual(result, best.candidate.key, best.score, textTop.matchKind === 'room-code' ? 'room-code' : 'icon+ocr');
+          return;
+        }
+        if (visualVeryStrong && (result.status === 'unknown' || textScore < .88)) { setResultFromVisual(result, best.candidate.key, best.score); return; }
       }
 
       async function visualMatchResults(expectedToken = state.imageLoadToken) {
-        if (expectedToken !== state.imageLoadToken) return;
-        if (!state.image || state.visualBusy) return;
-        const pendingResults = state.results.filter((result) => result.status !== 'identified' || result.confidence < 94);
-        if (!pendingResults.length) return;
-        state.visualBusy = true;
+        if (expectedToken !== state.imageLoadToken || !state.image || state.visualBusy) return expectedToken === state.imageLoadToken;
+        state.visualBusy = true; state.visualReady = false;
         try {
+          const visualTargets = state.results.filter((result) => {
+            const top = result.matches?.[0];
+            return result.status !== 'identified' || result.confidence < 90 || !top || top.score < .90;
+          });
+          if (!visualTargets.length) return true;
+          const candidateIds = new Set();
+          let useFullCatalog = false;
+          for (const result of visualTargets) {
+            const matches = Array.isArray(result.matches) ? result.matches : [];
+            if (!matches.length || (matches[0]?.score || 0) < .78) useFullCatalog = true;
+            matches.slice(0, 8).forEach((match) => candidateIds.add(match.keyId));
+          }
+          const keysToLoad = useFullCatalog ? DATA.keys : DATA.keys.filter((key) => candidateIds.has(key.id));
           const loaded = [];
-          const pendingKeys = [...DATA.keys];
+          const pendingKeys = [...keysToLoad];
           const loadWorker = async () => {
             while (pendingKeys.length) {
+              if (expectedToken !== state.imageLoadToken) return;
               const key = pendingKeys.shift();
               if (!key) return;
-              const image = await loadLocalIcon(key);
-              if (image) loaded.push({ key, signature: makeSignature(image) });
+              let signature = visualSignatureCache.get(key.id);
+              if (signature === undefined) {
+                const image = await loadLocalIcon(key);
+                signature = image ? makeSignature(image, null, 32) : null;
+                visualSignatureCache.set(key.id, signature);
+              }
+              if (signature) loaded.push({ key, signature });
             }
           };
           await Promise.all(Array.from({ length: 16 }, loadWorker));
-          if (expectedToken !== state.imageLoadToken) return;
-          if (!loaded.length) return;
-          setProgress(91, `アイコン ${loaded.length}件を照合中…`);
-          for (let index = 0; index < pendingResults.length; index++) {
-            if (expectedToken !== state.imageLoadToken) return;
-            const result = pendingResults[index];
-            const sample = cellVisualSignature(result);
-            const ranked = loaded.map((candidate) => ({ candidate, score: Math.max(0, 1 - signatureDistance(sample, candidate.signature) * 1.55) })).sort((a, b) => b.score - a.score);
-            const best = ranked[0];
-            const second = ranked[1];
-            if (!best) continue;
-            result.visualKeyId = best.candidate.key.id;
-            result.visualScore = Math.round(best.score * 100);
-            result.visualMargin = Math.round((best.score - (second?.score || 0)) * 100);
-            const textTop = result.matches?.[0];
-            const visualIsStrong = best.score >= .84 && (!second || best.score - second.score >= .06);
-            const textIsUsable = textTop && textTop.score >= .70;
-            if (visualIsStrong && (!textIsUsable || textTop.keyId === best.candidate.key.id)) {
-              result.keyId = best.candidate.key.id;
-              if (textTop?.keyId !== best.candidate.key.id) result.matches = [{ keyId: best.candidate.key.id, key: best.candidate.key, score: best.score, alias: 'icon' }, ...(result.matches || [])].slice(0, 5);
-              result.status = textTop?.keyId === best.candidate.key.id && textTop.score >= .92 ? 'identified' : 'ambiguous';
-              result.confidence = clamp(Math.round(best.score * 100), 1, 99);
-              const usage = parseUsage(result.ocrText, best.candidate.key);
-              if (usage) { result.remaining = usage.remaining; result.maximum = usage.maximum; result.usageSource = 'ocr'; }
-              else { result.maximum = best.candidate.key.uses; result.usageSource = best.candidate.key.uses == null ? 'not-found' : 'database'; }
+          if (expectedToken !== state.imageLoadToken) return false;
+          if (!loaded.length) return true;
+          state.visualReady = true;
+          setProgress(84, 'キーアイコンを照合中…');
+          for (let index = 0; index < visualTargets.length; index++) {
+            if (expectedToken !== state.imageLoadToken) return false;
+            const result = visualTargets[index];
+            const samples = cellVisualSignatures(result);
+            const ranked = loaded.map((candidate) => ({ candidate, score: visualSimilarity(samples, candidate.signature) })).sort((a, b) => b.score - a.score);
+            applyVisualEvidence(result, ranked);
+            if (index % 4 === 0 || index === visualTargets.length - 1) {
+              setProgress(84 + (index / Math.max(1, visualTargets.length - 1)) * 14, 'アイコン照合 ' + (index + 1) + '/' + visualTargets.length + 'セル…');
+              scheduleRender();
             }
-            if (index % 5 === 0) setProgress(91 + (index / Math.max(1, pendingResults.length)) * 7, `アイコン照合 ${index + 1}/${pendingResults.length}セル…`);
           }
+          return true;
         } finally {
           state.visualBusy = false;
         }
@@ -1005,11 +1212,13 @@
 
       function keyUsageText(key) {
         if (!key) return '使用マップは未判定';
+        if (key.kind === 'non-key') return '鍵収納ケース（物理キーではないためマップ判定対象外）';
         if (!key.usages?.length) return '同梱スナップショットにマップ扉参照なし';
         return key.usages.map((usage) => `${usage.map}（${usage.doorCount || 0}箇所）`).join(' / ');
       }
 
       function usageDetailText(key) {
+        if (key?.kind === 'non-key') return '鍵を収納するケースです。物理キーではないため、使用マップはありません。';
         if (!key?.usages?.length) return '現行スナップショットでは使用扉の参照が見つかりません。Wikiリンクで確認してください。';
         const chunks = [];
         for (const usage of key.usages) {
@@ -1133,7 +1342,7 @@
 
       function makeResultsFromGrid(grid) {
         state.grid = grid;
-        state.results = grid.cells.map((cell, index) => ({ id: cell.id, index, cell, keyId: null, key: null, status: 'unknown', confidence: 0, matches: [], matchKind: null, ocrText: '', ocrConfidence: 0, remaining: null, maximum: null, usageSource: 'not-found' }));
+        state.results = grid.cells.map((cell, index) => ({ id: cell.id, index, cell, keyId: null, key: null, status: 'unknown', confidence: 0, matches: [], matchKind: null, ocrText: '', ocrConfidence: 0, ocrSource: '', gridOcrText: '', gridOcrConfidence: 0, visualKeyId: null, visualScore: null, visualMargin: null, remaining: null, maximum: null, usageSource: 'not-found' }));
         refs.gridStatus.textContent = `${grid.columns}×${grid.rows} / ${grid.cells.length}候補`;
         refs.summaryHint.textContent = grid.fallback ? '簡易グリッド' : `信頼度 ${Math.round(grid.score * 100)}%`;
         renderAll();
@@ -1220,23 +1429,26 @@
 
       function renderCard(result) {
         const key = currentKey(result);
+        const isNonKey = key?.kind === 'non-key';
         const colorClass = confidenceClass(result);
-        const usage = result.maximum != null ? `${result.remaining != null ? `${result.remaining}/` : '最大'}${result.maximum}` : '回数不明';
-        const usageTitle = result.remaining != null
-          ? '画像の使用回数OCRで読み取った残り/最大'
-          : result.maximum != null
-            ? '同梱DBの最大使用回数（画像から残り回数を読み取れなかった項目）'
-            : '使用回数不明';
+        const usage = isNonKey ? '対象外' : result.maximum != null ? `${result.remaining != null ? `${result.remaining}/` : '最大'}${result.maximum}` : '回数不明';
+        const usageTitle = isNonKey
+          ? '鍵収納ケースのため、使用回数・マップ判定の対象外'
+          : result.remaining != null
+            ? '画像の使用回数OCRで読み取った残り/最大'
+            : result.maximum != null
+              ? '同梱DBの最大使用回数（画像から残り回数を読み取れなかった項目）'
+              : '使用回数不明';
         const maps = mapNamesForKey(key);
-        const mapChips = maps.length ? maps.map((map) => `<span class="chip map">⌖ ${escapeHtml(map)}</span>`).join('') : '<span class="chip">マップ参照なし</span>';
-        const statusText = result.status === 'unknown' ? '未判定' : result.status === 'ambiguous' ? '候補を確認' : result.status === 'manual' ? '手動確定' : '認識済み';
-        const icon = key ? `<img src="${escapeHtml(localIconUrl(key))}" data-remote-src="${escapeHtml(key.icon || '')}" alt="" loading="lazy"><span class="key-fallback" hidden>⚿</span>` : '<span class="key-fallback">⚿</span>';
+        const mapChips = isNonKey ? '<span class="chip">対象外（物理キーではない）</span>' : maps.length ? maps.map((map) => `<span class="chip map">⌖ ${escapeHtml(map)}</span>`).join('') : '<span class="chip">マップ参照なし</span>';
+        const statusText = isNonKey ? '対象外' : result.status === 'unknown' ? '未判定' : result.status === 'ambiguous' ? '候補を確認' : result.status === 'manual' ? '手動確定' : '認識済み';
+        const icon = isNonKey ? '<span class="key-fallback">▣</span>' : key ? `<img src="${escapeHtml(localIconUrl(key))}" data-remote-src="${escapeHtml(key.icon || '')}" alt="" loading="lazy"><span class="key-fallback" hidden>⚿</span>` : '<span class="key-fallback">⚿</span>';
         const name = key ? escapeHtml(key.shortName || key.name) : '未判定の鍵';
         const fullName = key ? escapeHtml(key.name) : 'OCRと同梱DBで一致しませんでした';
         const detail = key ? usageDetailText(key) : '手動修正から鍵名を選択できます。';
         const visualInfo = result.visualScore != null ? `<br><strong>画像照合：</strong>${result.visualScore}%${result.visualMargin != null ? `（候補差 ${result.visualMargin}%）` : ''}` : '';
-        const candidateInfo = result.status === 'ambiguous' && result.matches?.length > 1
-          ? `<br><strong>候補：</strong>${result.matches.slice(0, 4).map((match) => {
+        const candidateInfo = (result.status === 'ambiguous' || result.matchKind === 'label-only') && result.matches?.length > 1
+          ? `<br><strong>${result.matchKind === 'label-only' ? '同名候補：' : '候補：'}</strong>${result.matches.slice(0, 4).map((match) => {
             const shortName = match.key.shortName || match.key.name;
             const maps = mapNamesForKey(match.key);
             const extra = match.key.name && match.key.name !== shortName ? ` / ${match.key.name}` : '';
@@ -1247,7 +1459,7 @@
           ? `<br><strong>OCR補正：</strong>${escapeHtml(key.shortName || key.name)}（部屋番号形式で照合）`
           : '';
         return `<article class="result-card ${result.status} ${result.id === state.selectedResultId ? 'selected' : ''}" data-result-id="${escapeHtml(result.id)}">
-          <div class="result-top"><div class="item-thumb">${icon}</div><div class="result-main"><div class="result-name-line"><div class="result-short">${name}</div><span class="confidence ${colorClass}">${result.confidence ? `${result.confidence}%` : statusText}</span></div><div class="result-full">${fullName}</div></div></div>
+          <div class="result-top"><div class="item-thumb">${icon}</div><div class="result-main"><div class="result-name-line"><div class="result-short">${name}</div><span class="confidence ${colorClass}">${isNonKey ? statusText : result.confidence ? `${result.confidence}%` : statusText}</span></div><div class="result-full">${fullName}</div></div></div>
           <div class="result-meta">${mapChips}<span class="chip uses" title="${escapeHtml(usageTitle)}">↻ ${escapeHtml(usage)}</span></div>
           <div class="result-extra"><strong>使用先：</strong>${escapeHtml(detail)}<br><strong>OCR：</strong><span class="ocr-text">${escapeHtml(result.ocrText || '—')}</span>${correctionInfo}${candidateInfo}${visualInfo}</div>
           <div class="result-actions"><button class="btn btn-small" type="button" data-action="edit">手動修正</button>${key?.wiki ? `<a class="btn btn-small" href="${escapeHtml(key.wiki)}" target="_blank" rel="noreferrer">Wiki</a>` : ''}${key?.link ? `<a class="btn btn-small" href="${escapeHtml(key.link)}" target="_blank" rel="noreferrer">DB</a>` : ''}</div>
@@ -1555,10 +1767,126 @@
         return String(value || '').replace(/[\r\n]+/g, ' ').replace(/\s+/g, ' ').trim();
       }
 
+      function enhanceTextCanvas(canvas, variant) {
+        if (!canvas || variant === 'normal') return;
+        const context = canvas.getContext('2d', { willReadFrequently: true });
+        if (!context) return;
+        try {
+          const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+          const pixels = imageData.data;
+          for (let index = 0; index < pixels.length; index += 4) {
+            const luminance = pixels[index] * .2126 + pixels[index + 1] * .7152 + pixels[index + 2] * .0722;
+            let value = clamp((luminance - 30) * 1.75, 0, 255);
+            if (variant === 'threshold') value = value >= 82 ? 255 : value * .12;
+            pixels[index] = value;
+            pixels[index + 1] = value;
+            pixels[index + 2] = value;
+          }
+          context.putImageData(imageData, 0, 0);
+        } catch (_) {
+          // Text enhancement is optional; the unmodified crop remains usable.
+        }
+      }
+
+      function makeGridOcrCanvas(variant = 'normal') {
+        if (!state.image || !state.grid) return null;
+        const grid = state.grid;
+        const padding = Math.max(0, Math.min(3, grid.cellWidth * .04));
+        const sourceX = clamp(grid.x - padding, 0, state.canvasWidth - 1);
+        const sourceY = clamp(grid.y - padding, 0, state.canvasHeight - 1);
+        const sourceWidth = clamp(grid.cellWidth * grid.columns + padding * 2, 1, state.canvasWidth - sourceX);
+        const sourceHeight = clamp(grid.cellHeight * grid.rows + padding * 2, 1, state.canvasHeight - sourceY);
+        const scale = variant === 'threshold' ? 2.8 : 2.4;
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(sourceWidth * scale));
+        canvas.height = Math.max(1, Math.round(sourceHeight * scale));
+        const context = canvas.getContext('2d');
+        if (!context) return null;
+        context.imageSmoothingEnabled = variant !== 'threshold';
+        context.fillStyle = '#101820';
+        context.fillRect(0, 0, canvas.width, canvas.height);
+        context.filter = variant === 'soft' ? 'contrast(1.18) brightness(1.08)' : 'none';
+        context.drawImage(state.image, sourceX, sourceY, sourceWidth, sourceHeight, 0, 0, canvas.width, canvas.height);
+        context.filter = 'none';
+        enhanceTextCanvas(canvas, variant);
+        return { canvas, scale, sourceX, sourceY };
+      }
+
+      function assignGridOcrWords(response, geometry) {
+        if (!geometry || !state.results.length) return;
+        const buckets = new Map(state.results.map((result) => [result.id, []]));
+        const words = Array.isArray(response?.data?.words) ? response.data.words : [];
+        for (const word of words) {
+          const text = cleanCellOcrText(word?.text);
+          const box = word?.bbox || {};
+          if (!text || !/[a-z]/i.test(text)) continue;
+          const rawX0 = Number(box.x0), rawY0 = Number(box.y0), rawX1 = Number(box.x1), rawY1 = Number(box.y1);
+          if (![rawX0, rawY0, rawX1, rawY1].every(Number.isFinite) || rawX1 <= rawX0 || rawY1 <= rawY0) continue;
+          const x0 = geometry.sourceX + rawX0 / geometry.scale;
+          const y0 = geometry.sourceY + rawY0 / geometry.scale;
+          const x1 = geometry.sourceX + rawX1 / geometry.scale;
+          const y1 = geometry.sourceY + rawY1 / geometry.scale;
+          const wordWidth = Math.max(1, x1 - x0), wordHeight = Math.max(1, y1 - y0);
+          const centerX = (x0 + x1) / 2, centerY = (y0 + y1) / 2;
+          let best = null;
+          for (const result of state.results) {
+            const cell = result.cell;
+            const bandTop = cell.y - cell.height * .05;
+            const bandBottom = cell.y + cell.height * .38;
+            const verticalOverlap = Math.min(y1, bandBottom) - Math.max(y0, bandTop);
+            const horizontalOverlap = Math.min(x1, cell.x + cell.width) - Math.max(x0, cell.x);
+            if (verticalOverlap <= 0 || horizontalOverlap <= 0 || centerY < bandTop || centerY > bandBottom) continue;
+            const centerDistance = Math.abs(centerX - (cell.x + cell.width / 2)) / Math.max(1, cell.width);
+            const score = verticalOverlap / wordHeight * .55 + horizontalOverlap / wordWidth * .45 - centerDistance * .12;
+            if (!best || score > best.score) best = { result, score };
+          }
+          if (best) buckets.get(best.result.id).push({ text, x: centerX, confidence: Number(word.confidence) || 0 });
+        }
+        for (const result of state.results) {
+          const entries = buckets.get(result.id) || [];
+          entries.sort((left, right) => left.x - right.x);
+          const unique = entries.filter((entry, index, list) => index === 0 || entry.text.toLowerCase() !== list[index - 1].text.toLowerCase());
+          result.gridOcrText = unique.map((entry) => entry.text).join(' ');
+          result.gridOcrConfidence = unique.length ? unique.reduce((sum, entry) => sum + entry.confidence, 0) / unique.length : 0;
+        }
+      }
+
+      async function readWholeGridLabels(worker, expectedToken = state.imageLoadToken) {
+        const prepared = makeGridOcrCanvas('normal');
+        if (!prepared || !worker) return false;
+        try {
+          await worker.setParameters({
+            tessedit_pageseg_mode: '11',
+            preserve_interword_spaces: '1',
+            tessedit_char_whitelist: 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-./|\\ ',
+          });
+          const response = await worker.recognize(prepared.canvas);
+          if (expectedToken !== state.imageLoadToken) return false;
+          assignGridOcrWords(response, prepared);
+          return true;
+        } finally {
+          prepared.canvas.width = 1;
+          prepared.canvas.height = 1;
+        }
+      }
+
+      function ocrAttemptQuality(attempt) {
+        const top = attempt?.matches?.[0];
+        if (!top) return -1;
+        const second = attempt.matches[1];
+        const margin = top.score - (second?.score || 0);
+        const exactBonus = top.score >= .99 || top.matchKind === 'room-code' ? .08 : 0;
+        return top.score * .74 + Math.min(1, (Number(attempt.confidence) || 0) / 100) * .16 + Math.min(.08, Math.max(0, margin) * .16) + exactBonus;
+      }
+
+      function chooseOcrAttempt(attempts) {
+        return attempts.filter(Boolean).sort((left, right) => ocrAttemptQuality(right) - ocrAttemptQuality(left))[0] || { text: '', confidence: 0, matches: [], source: 'none' };
+      }
+
       function makeCellOcrCanvas(result, variant = 'normal') {
         const cell = result.cell;
-        const scale = variant === 'soft' ? 6 : 5;
-        const labelHeight = variant === 'soft' ? clamp(cell.height * .31, 17, 24) : clamp(cell.height * .27, 14, 21);
+        const scale = variant === 'threshold' ? 7 : variant === 'soft' ? 6 : 5;
+        const labelHeight = variant === 'threshold' ? clamp(cell.height * .35, 18, 27) : variant === 'soft' ? clamp(cell.height * .31, 17, 24) : clamp(cell.height * .27, 14, 21);
         // The source screenshot has no number badge; the badge is drawn later
         // by the overlay.  Keep the complete cell width so centered labels
         // such as "Company" and "Iron gate" are not cut at the first letter.
@@ -1568,19 +1896,31 @@
         canvas.width = Math.max(1, Math.round(sourceWidth * scale));
         canvas.height = Math.max(1, Math.round(labelHeight * scale));
         const context = canvas.getContext('2d');
-        context.imageSmoothingEnabled = variant === 'soft';
+        context.imageSmoothingEnabled = variant !== 'threshold';
         context.fillStyle = '#101820';
         context.fillRect(0, 0, canvas.width, canvas.height);
-        // Read only the small name band at the top of this cell.
-        context.filter = variant === 'soft' ? 'contrast(1.22) brightness(1.08)' : 'none';
-        context.drawImage(state.image, sourceX, cell.y + (variant === 'soft' ? 0 : 1), sourceWidth, labelHeight, 0, 0, canvas.width, Math.round(labelHeight * scale));
+        // Read the complete name band, then use grayscale/threshold variants
+        // only when the first OCR pass is not dictionary-backed.
+        context.filter = variant === 'threshold' ? 'contrast(1.12) brightness(1.04)' : variant === 'soft' ? 'contrast(1.28) brightness(1.10)' : 'none';
+        context.drawImage(state.image, sourceX, cell.y + (variant === 'threshold' ? 0 : 1), sourceWidth, labelHeight, 0, 0, canvas.width, Math.round(labelHeight * scale));
         context.filter = 'none';
+        enhanceTextCanvas(canvas, variant);
         return canvas;
       }
 
       async function readCellNames(workers, expectedToken = state.imageLoadToken) {
         const pool = (Array.isArray(workers) ? workers : [workers]).filter(Boolean);
         if (!pool.length) return false;
+        state.results.forEach((result) => {
+          result.gridOcrText = '';
+          result.gridOcrConfidence = 0;
+          result.visualKeyId = null;
+          result.visualScore = null;
+          result.visualMargin = null;
+        });
+        setProgress(17, 'グリッド全体の文字を読み取り中…');
+        try { await readWholeGridLabels(pool[0], expectedToken); } catch (_) { /* cell OCR remains the primary path */ }
+        if (expectedToken !== state.imageLoadToken) return false;
         try {
           await Promise.all(pool.map((worker) => worker.setParameters({
             tessedit_pageseg_mode: '7',
@@ -1598,54 +1938,51 @@
             const index = nextIndex++;
             if (index >= state.results.length) return;
             const result = state.results[index];
-            const canvas = makeCellOcrCanvas(result);
             result.ocrText = '';
             result.ocrConfidence = 0;
+            result.matches = [];
+            result.keyId = null;
+            result.status = 'unknown';
+            result.confidence = 0;
+            result.matchKind = null;
             try {
-              const response = await worker.recognize(canvas);
-              const firstText = cleanCellOcrText(response?.data?.text);
-              const firstConfidence = Number(response?.data?.confidence || 0);
-              let best = { text: firstText, confidence: Number.isFinite(firstConfidence) ? firstConfidence : 0, matches: chooseBestMatch(firstText) };
-              const firstScore = best.matches[0]?.score || 0;
-              const structuredMatchIsStrong = best.matches[0]?.matchKind === 'room-code' && firstScore >= .92;
-              // A structured room-code correction is already dictionary-backed;
-              // do not spend a second OCR pass on it. Other weak labels retain
-              // the alternate preprocessing pass for accuracy.
-              if (!best.matches.length || (firstScore < .84 && !structuredMatchIsStrong)) {
-                const alternateCanvas = makeCellOcrCanvas(result, 'soft');
+              const attempts = [];
+              const gridText = cleanCellOcrText(result.gridOcrText);
+              if (gridText) attempts.push({ text: gridText, confidence: result.gridOcrConfidence, matches: chooseBestMatch(gridText), source: 'grid' });
+              const recognizeVariant = async (variant) => {
+                const canvas = makeCellOcrCanvas(result, variant);
                 try {
-                  const alternate = await worker.recognize(alternateCanvas);
-                  const alternateText = cleanCellOcrText(alternate?.data?.text);
-                  const alternateConfidence = Number(alternate?.data?.confidence || 0);
-                  const alternateMatches = chooseBestMatch(alternateText);
-                  const alternateScore = alternateMatches[0]?.score || 0;
-                  const firstMargin = best.matches[1] ? firstScore - best.matches[1].score : firstScore;
-                  const alternateMargin = alternateMatches[1] ? alternateScore - alternateMatches[1].score : alternateScore;
-                  if (alternateScore > firstScore || (alternateScore === firstScore && alternateMargin > firstMargin) || (alternateScore === firstScore && alternateMargin === firstMargin && alternateConfidence > best.confidence)) {
-                    best = { text: alternateText, confidence: Number.isFinite(alternateConfidence) ? alternateConfidence : 0, matches: alternateMatches };
-                  }
-                } catch (_) {
-                  // Keep the primary crop when the optional second crop fails.
+                  const response = await worker.recognize(canvas);
+                  const text = cleanCellOcrText(response?.data?.text);
+                  const confidence = Number(response?.data?.confidence || 0);
+                  return { text, confidence: Number.isFinite(confidence) ? confidence : 0, matches: chooseBestMatch(text), source: variant === 'normal' ? 'cell' : 'cell-' + variant };
                 } finally {
-                  alternateCanvas.width = 1;
-                  alternateCanvas.height = 1;
+                  canvas.width = 1;
+                  canvas.height = 1;
                 }
+              };
+              const primary = await recognizeVariant('normal');
+              attempts.push(primary);
+              const primaryScore = primary.matches[0]?.score || 0;
+              const structuredMatchIsStrong = primary.matches[0]?.matchKind === 'room-code' && primaryScore >= .92;
+              if (!structuredMatchIsStrong && (primaryScore < .90 || primary.confidence < 62 || !primary.matches.length)) {
+                attempts.push(await recognizeVariant('soft'));
+                const current = chooseOcrAttempt(attempts);
+                if (!current.matches.length || (current.matches[0]?.score || 0) < .84) attempts.push(await recognizeVariant('threshold'));
               }
-              result.ocrText = best.text;
+              const best = chooseOcrAttempt(attempts);
+              result.ocrText = best.text || primary.text || gridText;
               result.ocrConfidence = best.confidence;
+              result.ocrSource = best.source;
               applyMatch(result, best.matches, result.ocrConfidence);
               successful++;
             } catch (_) {
               failed++;
               applyMatch(result, [], 0);
-            } finally {
-              // Do not retain enlarged canvases after each recognition.
-              canvas.width = 1;
-              canvas.height = 1;
             }
             completed++;
-            if (completed % 8 === 0 || completed === state.results.length) {
-              setProgress(18 + (completed / Math.max(1, state.results.length)) * 78, `セル名を読み取り中 ${completed}/${state.results.length}…`);
+            if (completed % 4 === 0 || completed === state.results.length) {
+              setProgress(18 + (completed / Math.max(1, state.results.length)) * 58, 'セル名を読み取り中 ' + completed + '/' + state.results.length + '…');
               scheduleRender();
             }
           }
@@ -1730,6 +2067,7 @@
           setProgress(16, `${state.results.length}セルの名前帯をOCR中…`);
           if (!await readCellNames(workers, expectedToken)) return;
           if (!await readRemainingUses(workers, expectedToken)) return;
+          if (!await visualMatchResults(expectedToken)) return;
           if (expectedToken !== state.imageLoadToken) return;
           setProgress(100, `完了：${state.results.filter((result) => result.keyId).length}/${state.results.length}件を照合`);
           renderAll();
@@ -1854,6 +2192,14 @@
         if (!result) return;
         result.keyId = null; result.key = null; result.status = 'unknown'; result.confidence = 0; result.matchKind = null; result.matches = []; result.maximum = null; result.remaining = null; result.usageSource = 'not-found'; renderAll(); closeEdit();
       });
+
+      // Keep the normal single-file app private, but expose a small read-only
+      // inspection surface for local acceptance tests when ?debug=1 is used.
+      if (new URLSearchParams(location.search).get('debug') === '1') {
+        window.__TARKOV_KEY_LENS_STATE = state;
+        window.__TARKOV_KEY_LENS_DEBUG = { chooseBestMatch, visualMatchResults, signatureDistance, cellVisualSignatures, visualSimilarity, makeSignature, loadLocalIcon, visualSignatureCache };
+        window.chooseBestMatch = chooseBestMatch;
+      }
 
       if (DATA.keys.length) {
         const timestamp = DATA.generatedAt ? new Date(DATA.generatedAt) : null;
